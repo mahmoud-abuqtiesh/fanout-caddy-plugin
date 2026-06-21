@@ -1,0 +1,10 @@
+# built caddy binary (xcaddy output)
+/caddy-test
+/caddy
+
+# logs
+*.log
+
+# local test / infra configs — never commit
+*.Caddyfile
+*.live-backup-*
