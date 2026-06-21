@@ -4,9 +4,10 @@
 //
 // It is intended for control-plane fan-out — e.g. pushing a token to every
 // Janus WebRTC server registered behind a single Multivalue Answer record.
-// Backend responses are intentionally discarded; the client receives a 200
-// once every backend has been sent the request (best-effort, bounded by
-// timeout).
+// The request succeeds only if ALL backends return 2xx; the client then gets
+// one backend's response replayed verbatim (the broadcast writes this handles
+// produce identical responses). If any backend fails, times out, or returns
+// non-2xx, the client gets 502 so the caller's success check can detect it.
 package fanout
 
 import (
@@ -17,7 +18,6 @@ import (
 	"maps"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -106,6 +106,16 @@ func (f *Fanout) Cleanup() error {
 	return nil
 }
 
+// backendResult captures one backend's response so the aggregate can decide
+// success and replay a real response to the client. Each goroutine writes its
+// own slice index, so there is no shared mutable state to guard.
+type backendResult struct {
+	status int
+	header http.Header
+	body   []byte
+	ok     bool
+}
+
 // ServeHTTP resolves the current backend set and broadcasts the request to all
 // of them. It is terminal: it writes the client response itself and never calls
 // next.
@@ -162,31 +172,63 @@ func (f *Fanout) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.H
 
 	origVars, _ := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
 
-	var failures int64
+	results := make([]backendResult, len(handlers))
 	var wg sync.WaitGroup
-	for _, h := range handlers {
+	for i, h := range handlers {
 		wg.Add(1)
-		go func(h *reverseproxy.Handler) {
+		go func(i int, h *reverseproxy.Handler) {
 			defer wg.Done()
 			clone := f.cloneRequest(r, ctx, origVars, body)
-			// Discard the backend's response; we only care that it was sent.
-			rec := caddyhttp.NewResponseRecorder(&nopResponseWriter{}, nil,
-				func(int, http.Header) bool { return false })
-			if err := h.ServeHTTP(rec, clone, caddyhttp.HandlerFunc(emptyNext)); err != nil {
-				atomic.AddInt64(&failures, 1)
-				f.logger.Warn("fanout: upstream send failed",
-					zap.String("upstream", h.Upstreams[0].Dial), zap.Error(err))
+			// Buffer the backend's response: shouldBuffer=true keeps the body
+			// out of the client (it lands in buf) so we can inspect status,
+			// headers, and body to build the aggregate.
+			nrw := &nopResponseWriter{}
+			buf := new(bytes.Buffer)
+			rec := caddyhttp.NewResponseRecorder(nrw, buf,
+				func(int, http.Header) bool { return true })
+			err := h.ServeHTTP(rec, clone, caddyhttp.HandlerFunc(emptyNext))
+			ok := err == nil && rec.Status() >= 200 && rec.Status() < 300
+			// reverse_proxy copies the upstream headers into nrw.Header().
+			results[i] = backendResult{
+				status: rec.Status(),
+				header: nrw.Header(),
+				body:   buf.Bytes(),
+				ok:     ok,
 			}
-		}(h)
+			if !ok {
+				f.logger.Warn("fanout: upstream send failed",
+					zap.String("upstream", h.Upstreams[0].Dial),
+					zap.Int("status", rec.Status()), zap.Error(err))
+			}
+		}(i, h)
 	}
 	wg.Wait()
 
-	if int(failures) >= len(handlers) {
+	// Success requires EVERY backend to have returned 2xx: a server missing the
+	// token is exactly the failure the caller needs to be alarmed about.
+	var success *backendResult
+	allOK := true
+	for i := range results {
+		if !results[i].ok {
+			allOK = false
+		} else if success == nil {
+			success = &results[i]
+		}
+	}
+	if !allOK || success == nil {
 		return caddyhttp.Error(http.StatusBadGateway,
-			fmt.Errorf("fanout: all %d upstream(s) failed", len(handlers)))
+			fmt.Errorf("fanout: not all %d upstream(s) succeeded", len(handlers)))
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Replay one good response verbatim — the broadcast writes are identical
+	// across backends, so any successful one is representative.
+	for k, vs := range success.header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(success.status)
+	_, _ = w.Write(success.body)
 	return nil
 }
 
