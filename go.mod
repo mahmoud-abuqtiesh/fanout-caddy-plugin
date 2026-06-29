@@ -1,4 +1,4 @@
-module github.com/maqsam/caddy-fanout
+module github.com/mahmoud-abuqtiesh/fanout-caddy-plugin
 
 go 1.25.0
 
