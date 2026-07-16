@@ -27,12 +27,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 // UnmarshalCaddyfile parses the fanout directive:
 //
 //	fanout [<name> <port>] {
-//	    name        <name>
-//	    port        <port>
-//	    refresh     <duration>
-//	    timeout     <duration>
-//	    versions    ipv4|ipv6 ...
-//	    max_body    <size>
+//	    name          <name>
+//	    port          <port>
+//	    refresh       <duration>
+//	    timeout       <duration>
+//	    versions      ipv4|ipv6 ...
+//	    max_body      <size>
+//	    response_mode all_success|lowest_status
 //	}
 func (f *Fanout) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume the directive name
@@ -94,6 +95,16 @@ func (f *Fanout) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			f.Resolver = &reverseproxy.UpstreamResolver{Addresses: addrs}
+		case "response_mode":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			switch d.Val() {
+			case "all_success", "lowest_status":
+				f.ResponseMode = d.Val()
+			default:
+				return d.Errf("unknown response_mode: %s (want all_success|lowest_status)", d.Val())
+			}
 		case "versions":
 			versions := d.RemainingArgs()
 			if len(versions) == 0 {

@@ -3,11 +3,17 @@
 // backends, rather than load-balancing to a single one (as reverse_proxy does).
 //
 // It is intended for control-plane fan-out — e.g. pushing a token to every
-// Janus WebRTC server registered behind a single Multivalue Answer record.
-// The request succeeds only if ALL backends return 2xx; the client then gets
-// one backend's response replayed verbatim (the broadcast writes this handles
-// produce identical responses). If any backend fails, times out, or returns
-// non-2xx, the client gets 502 so the caller's success check can detect it.
+// Janus WebRTC server registered behind a single Multivalue Answer record —
+// and for fanning a query out to every cell of a sharded deployment when the
+// owning cell isn't known in advance.
+//
+// One backend's response is replayed to the client verbatim; response_mode
+// picks which one. In "all_success" (default), the request succeeds only if
+// ALL backends return 2xx, else the client gets 502 — for control-plane
+// broadcasts, where a backend missing the write must be detectable. In
+// "lowest_status", the backend with the numerically lowest status wins (a
+// real response from one backend is never masked by another's error) — for
+// fanning a query out when exactly one backend actually owns the resource.
 package fanout
 
 import (
@@ -55,6 +61,13 @@ type Fanout struct {
 	// MaxBody is the maximum request body size buffered for fan-out, in bytes.
 	// Defaults to 1 MiB when zero. Requests with larger bodies get 413.
 	MaxBody int64 `json:"max_body,omitempty"`
+
+	// ResponseMode selects how upstream responses are aggregated:
+	//   "all_success"  (default) — every backend must return 2xx, else 502.
+	//                              Replays one 2xx response. (control-plane broadcast)
+	//   "lowest_status"          — replay the response with the numerically lowest
+	//                              HTTP status (>= 200) across backends. (fan-out query)
+	ResponseMode string `json:"response_mode,omitempty"`
 
 	aSource  *reverseproxy.AUpstreams
 	ctx      caddy.Context
@@ -110,10 +123,11 @@ func (f *Fanout) Cleanup() error {
 // success and replay a real response to the client. Each goroutine writes its
 // own slice index, so there is no shared mutable state to guard.
 type backendResult struct {
-	status int
-	header http.Header
-	body   []byte
-	ok     bool
+	status      int
+	header      http.Header
+	body        []byte
+	ok          bool // true when status is 2xx (all_success mode)
+	hasResponse bool // true when a real HTTP response was recorded (err == nil)
 }
 
 // ServeHTTP resolves the current backend set and broadcasts the request to all
@@ -187,13 +201,15 @@ func (f *Fanout) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.H
 			rec := caddyhttp.NewResponseRecorder(nrw, buf,
 				func(int, http.Header) bool { return true })
 			err := h.ServeHTTP(rec, clone, caddyhttp.HandlerFunc(emptyNext))
-			ok := err == nil && rec.Status() >= 200 && rec.Status() < 300
+			hasResponse := err == nil && rec.Status() != 0
+			ok := hasResponse && rec.Status() >= 200 && rec.Status() < 300
 			// reverse_proxy copies the upstream headers into nrw.Header().
 			results[i] = backendResult{
-				status: rec.Status(),
-				header: nrw.Header(),
-				body:   buf.Bytes(),
-				ok:     ok,
+				status:      rec.Status(),
+				header:      nrw.Header(),
+				body:        buf.Bytes(),
+				ok:          ok,
+				hasResponse: hasResponse,
 			}
 			if !ok {
 				f.logger.Warn("fanout: upstream send failed",
@@ -204,32 +220,64 @@ func (f *Fanout) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.H
 	}
 	wg.Wait()
 
-	// Success requires EVERY backend to have returned 2xx: a server missing the
-	// token is exactly the failure the caller needs to be alarmed about.
-	var success *backendResult
-	allOK := true
-	for i := range results {
-		if !results[i].ok {
-			allOK = false
-		} else if success == nil {
-			success = &results[i]
-		}
-	}
-	if !allOK || success == nil {
+	idx, replay := pickResponse(results, f.ResponseMode)
+	if !replay {
 		return caddyhttp.Error(http.StatusBadGateway,
 			fmt.Errorf("fanout: not all %d upstream(s) succeeded", len(handlers)))
 	}
 
-	// Replay one good response verbatim — the broadcast writes are identical
-	// across backends, so any successful one is representative.
-	for k, vs := range success.header {
+	// Replay the winning response verbatim.
+	winner := results[idx]
+	for k, vs := range winner.header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(success.status)
-	_, _ = w.Write(success.body)
+	w.WriteHeader(winner.status)
+	_, _ = w.Write(winner.body)
 	return nil
+}
+
+// normStatus normalizes a backend result to a comparable HTTP status: a
+// transport failure (no response recorded) or a 1xx status is treated as
+// 502, so a dead/incomplete backend can never win over a real response.
+func normStatus(r backendResult) int {
+	if !r.hasResponse || r.status < http.StatusOK {
+		return http.StatusBadGateway
+	}
+	return r.status
+}
+
+// pickResponse selects which buffered backend result to reply with. It
+// returns the winning index and whether it holds a real response to replay
+// (false means the caller should emit a clean 502 instead).
+func pickResponse(results []backendResult, mode string) (idx int, replay bool) {
+	switch mode {
+	case "lowest_status":
+		best := -1
+		bestNorm := 0
+		for i := range results {
+			n := normStatus(results[i])
+			if best == -1 || n < bestNorm {
+				best, bestNorm = i, n
+			}
+		}
+		if best == -1 {
+			return -1, false
+		}
+		return best, results[best].hasResponse && results[best].status >= http.StatusOK
+	default: // "" or "all_success" — existing behavior
+		firstOK := -1
+		for i := range results {
+			if !results[i].ok {
+				return -1, false // any failure => 502
+			}
+			if firstOK == -1 {
+				firstOK = i
+			}
+		}
+		return firstOK, firstOK != -1
+	}
 }
 
 // readBody buffers the request body up to MaxBody. The bool is false if the body
